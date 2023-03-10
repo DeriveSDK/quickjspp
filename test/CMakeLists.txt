@@ -10,6 +10,8 @@ endmacro()
 
 foreach(test
         value class exception example multicontext conversions point variant function_call inheritance jobs unhandled_rejection module_loader
+        enum
+        exotic
         )
 make_test(${test})
 endforeach()

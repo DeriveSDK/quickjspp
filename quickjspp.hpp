@@ -788,6 +788,19 @@ struct js_traits<ctor_wrapper<T, Args...>>
 };
 
 
+/** Conversions for enums. */
+template <typename E>
+struct js_traits<E, std::enable_if_t<std::is_enum_v<E>>> {
+    using T = std::underlying_type_t<E>;
+    static E unwrap(JSContext* ctx, JSValue v) noexcept {
+        return static_cast<E>(js_traits<T>::unwrap(ctx, v));
+    }
+
+    static JSValue wrap(JSContext* ctx, E t) noexcept {
+        return js_traits<T>::wrap(ctx, static_cast<T>(t));;
+    }
+};
+
 namespace detail {
 /** A faster std::function-like object with type erasure.
  * Used to convert any callable objects (including lambdas) to JSValue.
@@ -963,6 +976,7 @@ struct property_proxy
 template <auto M>
 struct get_set {};
 
+// M -  member object
 template <class T, typename R, R T::*M>
 struct get_set<M>
 {
@@ -976,6 +990,24 @@ struct get_set<M>
     static R& set(qjs::shared_ptr<T> ptr, R value)
     {
         return *ptr.*M = std::move(value);
+    }
+
+};
+
+// M - static member object
+template <typename R, R *M>
+struct get_set<M>
+{
+    using is_const = std::is_const<R>;
+
+    static const R& get(bool)
+    {
+        return *M;
+    }
+
+    static R& set(bool, R value)
+    {
+        return *M = std::move(value);
     }
 
 };
@@ -1096,7 +1128,7 @@ public:
     // add<&f>("f");
     // add<&T::f>("f");
     template <auto F>
-    std::enable_if_t<!std::is_member_object_pointer_v<decltype(F)>, Value&>
+    std::enable_if_t<std::is_member_function_pointer_v<decltype(F)> || std::is_function_v<std::remove_pointer_t<decltype(F)>>, Value&>
     add(const char * name)
     {
         (*this)[name] = fwrapper<F>{name};
@@ -1144,13 +1176,20 @@ public:
     add(const char * name)
     {
         if constexpr (detail::get_set<M>::is_const::value)
-        {
             return add_getter<detail::get_set<M>::get>(name);
-        }
         else
-        {
             return add_getter_setter<detail::get_set<M>::get, detail::get_set<M>::set>(name);
-        }
+    }
+
+    // add<&T::static_member>("static_member");
+    template <auto M>
+    std::enable_if_t<std::is_pointer_v<decltype(M)> && !std::is_function_v<std::remove_pointer_t<decltype(M)>> , Value&>
+    add(const char * name)
+    {
+        if constexpr (detail::get_set<M>::is_const::value)
+            return add_getter<detail::get_set<M>::get>(name);
+        else
+            return add_getter_setter<detail::get_set<M>::get, detail::get_set<M>::set>(name);
     }
 
     std::string
@@ -1372,9 +1411,12 @@ struct js_traits<qjs::shared_ptr<T>>
      * @param ctx context
      * @param name class name
      * @param proto class prototype or JS_NULL
+     * @param call QJS call function. see quickjs doc
+     * @param exotic pointer to QJS exotic methods(static lifetime) which allow custom property handling. see quickjs doc
      * @throws exception
      */
-    static void register_class(JSContext * ctx, const char * name, JSValue proto = JS_NULL)
+    static void register_class(JSContext * ctx, const char * name, JSValue proto = JS_NULL,
+                               JSClassCall * call = nullptr, JSClassExoticMethods * exotic = nullptr)
     {
         if(QJSClassId == 0)
         {
@@ -1384,8 +1426,14 @@ struct js_traits<qjs::shared_ptr<T>>
         if(!JS_IsRegisteredClass(rt, QJSClassId))
         {
             JSClassGCMark * marker = nullptr;
+            // automatically mark enable_shared_from_this::shared_this if derived from it
+            if constexpr(std::is_base_of_v<enable_shared_from_this<T>,T>)
+            {
+                markOffsets.push_back(reinterpret_cast<Value T::*>(&T::shared_this));
+            }
             if(!markOffsets.empty())
             {
+                markOffsets.shrink_to_fit();
                 marker = [](JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func) {
                     auto ptr = static_cast<const T *>(JS_GetOpaque(val, QJSClassId));
                     assert(ptr);
@@ -1409,9 +1457,9 @@ struct js_traits<qjs::shared_ptr<T>>
                     // mark
                     marker,
                     // call
-                    nullptr,
+                    call,
                     // exotic
-                    nullptr
+                    exotic
             };
             int e = JS_NewClass(rt, QJSClassId, &def);
             if(e < 0)
@@ -1455,7 +1503,11 @@ struct js_traits<qjs::shared_ptr<T>>
 template <class T>
 struct js_traits<T *>
 {
-    //static JSValue wrap(JSContext * ctx, T * ptr);
+    static JSValue wrap(JSContext * ctx, T * ptr) noexcept
+    {
+        static_assert(std::is_base_of_v<enable_shared_from_this<T>, T>, "T should be inherited from qjs::enable_shared_from_this<T> to enable T* conversions");
+        return js_traits<T>::wrap(ctx, *ptr);
+    }
     static T * unwrap(JSContext * ctx, JSValueConst v)
     {
         if(JS_IsNull(v))
@@ -1653,18 +1705,15 @@ public:
             qjs::Value prototype;
             qjs::Context::Module& module;
             qjs::Context& context;
+            qjs::Value ctor; // last added constructor
         public:
             explicit class_registrar(const char * name, qjs::Context::Module& module, qjs::Context& context) :
                     name(name),
                     prototype(context.newObject()),
                     module(module),
-                    context(context)
+                    context(context),
+                    ctor(JS_NULL)
             {
-                // mark enable_shared_from_this::shared_this if derived from it
-                if constexpr(std::is_base_of_v<enable_shared_from_this<T>,T>)
-                {
-                    mark<&T::shared_this>();
-                }
             }
 
             class_registrar(const class_registrar&) = delete;
@@ -1692,6 +1741,24 @@ public:
                 return *this;
             }
 
+            /** Add a static member or function to the last added constructor.
+             * Example:
+             *  struct T { static int var; static int func(); }
+             *  module.class_<T>("T").contructor<>("T").static_fun<&T::var>("var").static_fun<&T::func>("func");
+             */
+            template <auto F>
+            class_registrar& static_fun(const char * name)
+            {
+                assert(!JS_IsNull(ctor.v) && "You should call .constructor before .static_fun");
+                js_traits<qjs::shared_ptr<T>>::template ensureCanCastToBase<F>();
+                ctor.add<F>(name);
+                return *this;
+            }
+
+            /** Add a property with custom getter and setter.
+             * Example:
+             * module.class_<T>("T").property<&T::getX, &T::setX>("x");
+             */
             template <auto FGet, auto FSet = nullptr>
             class_registrar& property(const char * name)
             {
@@ -1713,9 +1780,9 @@ public:
             {
                 if(!name)
                     name = this->name;
-                Value ctor = context.newValue(qjs::ctor_wrapper<T, Args...>{name});
+                ctor = context.newValue(qjs::ctor_wrapper<T, Args...>{name});
                 JS_SetConstructor(context.ctx, ctor.v, prototype.v);
-                module.add(name, std::move(ctor));
+                module.add(name, qjs::Value{ctor});
                 return *this;
             }
 
@@ -1915,7 +1982,7 @@ struct js_traits<std::function<R(Args...)>, int>
 {
     static auto unwrap(JSContext * ctx, JSValueConst fun_obj)
     {
-        const int argc = sizeof...(Args);
+        constexpr int argc = sizeof...(Args);
         if constexpr(argc == 0)
         {
             return [jsfun_obj = Value{ctx, JS_DupValue(ctx, fun_obj)}]() -> R {
@@ -1927,7 +1994,7 @@ struct js_traits<std::function<R(Args...)>, int>
         }
         else
         {
-            return [jsfun_obj = Value{ctx, JS_DupValue(ctx, fun_obj)}](Args&& ... args) -> R {
+            return [jsfun_obj = Value{ctx, JS_DupValue(ctx, fun_obj)}](Args ... args) -> R {
                 const int argc = sizeof...(Args);
                 JSValue argv[argc];
                 detail::wrap_args(jsfun_obj.ctx, argv, std::forward<Args>(args)...);

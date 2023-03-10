@@ -5,7 +5,7 @@
 
 #define TYPES bool, int32_t, double, qjs::shared_ptr<test>, const qjs::shared_ptr<test>&, std::string, const std::string&
 
-class base_test
+class base_test : public qjs::enable_shared_from_this<base_test>
 {
 public:
     std::vector<std::vector<int>> base_field;
@@ -15,6 +15,10 @@ public:
         std::swap(x, base_field[0][0]);
         return x;
     }
+
+    // TODO: make it work in inherited classes
+    base_test * self() { return this; }
+    bool check_self(base_test * self) { return(this == self); }
 };
 
 class test : public base_test
@@ -49,8 +53,9 @@ public:
 
 
     static void fstatic(TYPES) {}
+    static bool bstatic;
 };
-
+bool test::bstatic = true;
 
 void f(TYPES) {}
 
@@ -66,6 +71,8 @@ void qjs_glue(qjs::Context::Module& m) {
     m.class_<::test>("test")
             .base<::base_test>()
             .constructor<::int32_t, bool, ::int32_t, double, ::qjs::shared_ptr<test>, ::qjs::shared_ptr<test> const &, ::std::string, ::std::string const &>("Test")
+            .static_fun<&::test::fstatic>("fstatic") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test>const &, ::std::string, ::std::string const &)
+            .static_fun<&::test::bstatic>("bstatic") // bool
             .constructor<::int32_t>("TestSimple")
             .fun<&::test::fi>("fi") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test> const &, ::std::string, ::std::string const &)
             .fun<&::test::fb>("fb") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test> const &, ::std::string, ::std::string const &)
@@ -73,12 +80,13 @@ void qjs_glue(qjs::Context::Module& m) {
             .fun<&::test::fspt>("fspt") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test> const&, ::std::string, ::std::string const &)
             .fun<&::test::fs>("fs") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test> const &, ::std::string, ::std::string const &)
             .fun<&::test::f>("f") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test> const &, ::std::string, ::std::string const &)
-            .fun<&::test::fstatic>("fstatic") // (bool, ::int32_t, double, ::std::shared_ptr<test>, ::std::shared_ptr<test>const &, ::std::string, ::std::string const &)
             .fun<&::test::b>("b") // bool
             .fun<&::test::i>("i") // ::int32_t
             .fun<&::test::d>("d") // double
             .fun<&::test::spt>("spt") // ::std::shared_ptr<test>
             .fun<&::test::s>("s") // ::std::string
+            .fun<&::test::self>("self")
+            .fun<&::test::check_self>("check_self")
             .property<&test::get_d, &test::set_d>("property_rw")
             .property<&test::get_d>("property_ro")
             .mark<&::test::spt>()
@@ -148,6 +156,8 @@ int main()
                                 "assert(5 === q.base_method(7));"
                                 "assert(7 === q.base_field[0][0]);"
                                 "assert(q.spt === q.fspt(t.vb, t.vi, t.vd, t, t, t.vs, \"test\"));" // same objects
+                                "assert(q.check_self(q));"
+                                "assert(!t.check_self(q));"
                                 "q.fi(t.vb, t.vi, t.vd, t, t, t.vs, \"test\")");
         assert((int)xxx == 18);
         auto yyy = context.eval("q.fi.bind(t)(t.vb, t.vi, t.vd, t, t, t.vs, \"test\")");
@@ -166,6 +176,8 @@ int main()
 
         auto qbase = context.eval("q").as<qjs::shared_ptr<base_test>>();
         assert(qbase->base_field[0][0] == 7);
+
+        assert((bool)context.eval("test.Test.bstatic === true"));
     }
     catch(exception)
     {
